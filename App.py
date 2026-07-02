@@ -120,15 +120,27 @@ def compute_style_weights(tilt):
     return {layer: float(w) for layer, w in zip(STYLE_LAYERS, raw)}
 
 
+def total_variation_loss(img):
+    """
+    Penalise pixel-to-pixel jaggedness so the result is smooth, not noisy.
+    Sums the absolute differences between each pixel and its right/bottom neighbour.
+    """
+    return (torch.sum(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:])) +
+            torch.sum(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :])))
+
+
 def run_style_transfer(content_t, style_t, vgg, beta, steps, style_weights,
-                       alpha=1.0, progress_cb=None):
+                       alpha=1.0, tv_weight=1.0, progress_cb=None):
     """Optimise the PIXELS of a generated image toward content + style. Returns a tensor."""
     content_feats = get_features(content_t, vgg)
     style_feats = get_features(style_t, vgg)
     style_grams = {l: gram_matrix(style_feats[l]) for l in STYLE_LAYERS}
 
     generated = content_t.clone().requires_grad_(True)
-    optimizer = optim.LBFGS([generated], max_iter=1)   # 1 closure == 1 real step
+    # strong_wolfe line search makes each L-BFGS step actually find a good step
+    # size, instead of a fixed lr=1 that stalls. This is what lets the style
+    # fully "set in". max_iter=1 keeps 1 step == 1 progress-bar tick.
+    optimizer = optim.LBFGS([generated], max_iter=1, line_search_fn="strong_wolfe")
 
     for step in range(steps):
         def closure():
@@ -136,7 +148,8 @@ def run_style_transfer(content_t, style_t, vgg, beta, steps, style_weights,
             gen_feats = get_features(generated, vgg)
             c = content_loss(content_feats, gen_feats)
             s = style_loss(style_grams, gen_feats, style_weights)
-            total = alpha * c + beta * s
+            tv = total_variation_loss(generated)
+            total = alpha * c + beta * s + tv_weight * tv
             total.backward()
             return total
 
@@ -276,9 +289,10 @@ with create_tab:
                    "keep this around 400 or below to stay within memory.")
     with col_b:
         steps = st.slider(
-            "Refinement passes", min_value=50, max_value=400, value=150, step=25,
-            help="More passes blend the style more smoothly; fewer finish faster.")
-        st.caption("Roughly linear with wait time. 150 is a good balance on CPU.")
+            "Refinement passes", min_value=50, max_value=800, value=300, step=25,
+            help="More passes let the style fully set in; fewer finish faster.")
+        st.caption("Roughly linear with wait time. 300 gives a strong result; "
+                   "drop to ~100 for a quick preview, raise toward 600+ for max effect.")
 
     with st.expander("Advanced — texture scale"):
         tilt = st.slider(
