@@ -1,13 +1,10 @@
 """
 Picasso, I Choose You! — Neural Style Transfer as a design tool.
 
-Upload a photo and an artwork; the app repaints your photo in the artwork's
-style. Built on the method from Gatys, Ecker & Bethge (2015), following
-Prof. Mitesh Khapra's "Deep Art" lecture (CS7015, IIT Madras).
-
-The heavy lifting (VGG feature extraction, Gram-based style loss, and the
-pixel-optimisation loop) lives in the "ENGINE" section. The "INTERFACE"
-section wraps it in controls an artist can use without knowing the maths.
+Engine faithfully follows the reference implementation
+(github.com/nazianafis/Neural-Style-Transfer, based on Aleksa Gordic's), which
+follows Gatys, Ecker & Bethge (2015) and Prof. Mitesh Khapra's Deep Art lecture.
+The Streamlit interface wraps that engine for designers and artists.
 """
 
 import io
@@ -23,140 +20,161 @@ from PIL import Image
 import streamlit as st
 
 # ----------------------------------------------------------------------------
-# ENGINE  (the model we built step by step — unchanged in spirit)
+# ENGINE  (faithful to the reference implementation)
 # ----------------------------------------------------------------------------
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
+# Reference preprocessing: images in the 0-255 range, mean-subtracted, NO std
+# division. This is the scale VGG's activations (and thus the reference's
+# weights) are tuned to.
+IMAGENET_MEAN_255 = [123.675, 116.28, 103.53]
+IMAGENET_STD_NEUTRAL = [1, 1, 1]
 
-# Layer index in vgg.features -> paper name. Only the six we use.
-LAYER_NAMES = {0: "conv1_1", 5: "conv2_1", 10: "conv3_1",
-               19: "conv4_1", 21: "conv4_2", 28: "conv5_1"}
-CONTENT_LAYERS = ["conv4_2"]
-STYLE_LAYERS = ["conv1_1", "conv2_1", "conv3_1", "conv4_1", "conv5_1"]
-_LAST_LAYER = max(LAYER_NAMES)  # stop the forward pass once we've grabbed everything
+
+class Vgg19(torch.nn.Module):
+    """
+    VGG19 sliced so a single forward pass returns the exact feature maps the
+    reference uses: five style layers (relu1_1..relu5_1) plus one content layer
+    (conv4_2), in this order:
+        [relu1_1, relu2_1, relu3_1, relu4_1, conv4_2, relu5_1]
+    Content is index 4; style is every other index.
+    """
+    def __init__(self):
+        super().__init__()
+        feats = models.vgg19(weights=VGG19_Weights.DEFAULT).features
+        self.content_index = 4
+        self.style_indices = [0, 1, 2, 3, 5]
+
+        self.slice1 = torch.nn.Sequential()
+        self.slice2 = torch.nn.Sequential()
+        self.slice3 = torch.nn.Sequential()
+        self.slice4 = torch.nn.Sequential()
+        self.slice5 = torch.nn.Sequential()
+        self.slice6 = torch.nn.Sequential()
+        for x in range(2):        # relu1_1  (indices 0,1)
+            self.slice1.add_module(str(x), feats[x])
+        for x in range(2, 7):     # relu2_1  (..6)
+            self.slice2.add_module(str(x), feats[x])
+        for x in range(7, 12):    # relu3_1  (..11)
+            self.slice3.add_module(str(x), feats[x])
+        for x in range(12, 21):   # relu4_1  (..20)
+            self.slice4.add_module(str(x), feats[x])
+        for x in range(21, 22):   # conv4_2  (21)  <- content
+            self.slice5.add_module(str(x), feats[x])
+        for x in range(22, 30):   # relu5_1  (..29)
+            self.slice6.add_module(str(x), feats[x])
+
+        for p in self.parameters():
+            p.requires_grad = False   # frozen feature extractor
+
+    def forward(self, x):
+        x = self.slice1(x); relu1_1 = x
+        x = self.slice2(x); relu2_1 = x
+        x = self.slice3(x); relu3_1 = x
+        x = self.slice4(x); relu4_1 = x
+        x = self.slice5(x); conv4_2 = x
+        x = self.slice6(x); relu5_1 = x
+        return [relu1_1, relu2_1, relu3_1, relu4_1, conv4_2, relu5_1]
 
 
 @st.cache_resource(show_spinner=False)
 def load_vgg():
-    """Load VGG19 once and reuse it across runs (frozen; weights never train)."""
-    vgg = models.vgg19(weights=VGG19_Weights.DEFAULT).features.eval()
-    for param in vgg.parameters():
-        param.requires_grad_(False)
-    return vgg.to(DEVICE)
+    return Vgg19().to(DEVICE).eval()
 
 
-def preprocess(pil_image, max_size):
-    """PIL image -> normalised (1,3,H,W) tensor on DEVICE."""
+def preprocess(pil_image, height):
+    """PIL -> (1,3,H,W) tensor in the 0-255 mean-subtracted space, on DEVICE."""
     image = pil_image.convert("RGB")
-    size = min(max(image.size), max_size)
     transform = transforms.Compose([
-        transforms.Resize(size),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        transforms.Resize(height),
+        transforms.ToTensor(),                                  # [0,1]
+        transforms.Lambda(lambda t: t.mul(255)),                # [0,255]
+        transforms.Normalize(mean=IMAGENET_MEAN_255,
+                             std=IMAGENET_STD_NEUTRAL),          # subtract mean
     ])
     return transform(image).unsqueeze(0).to(DEVICE)
 
 
 def deprocess(tensor):
-    """Normalised tensor -> viewable PIL image."""
-    image = tensor.clone().detach().cpu().squeeze(0)
-    mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
-    std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
-    image = image * std + mean
-    image = image.clamp(0, 1)
-    return transforms.ToPILImage()(image)
+    """Reverse the 0-255 mean-subtracted space back to a viewable PIL image."""
+    img = tensor.squeeze(0).detach().cpu().numpy()   # (3,H,W)
+    img = np.moveaxis(img, 0, 2)                     # (H,W,3)
+    img = img + np.array(IMAGENET_MEAN_255).reshape((1, 1, 3))
+    img = np.clip(img, 0, 255).astype("uint8")
+    return Image.fromarray(img)
 
 
-def get_features(image, model):
-    """Run the image through VGG, snapshotting activations at our chosen layers."""
-    features = {}
-    x = image
-    for index, layer in enumerate(model):
-        x = layer(x)
-        if index in LAYER_NAMES:
-            features[LAYER_NAMES[index]] = x
-        if index == _LAST_LAYER:
-            break
-    return features
+def gram_matrix(x, should_normalize=True):
+    b, ch, h, w = x.size()
+    features = x.view(b, ch, w * h)
+    features_t = features.transpose(1, 2)
+    gram = features.bmm(features_t)
+    if should_normalize:
+        gram /= ch * h * w
+    return gram
 
 
-def gram_matrix(feature_map):
-    """(1,C,H,W) -> normalised (C,C) Gram matrix (the style fingerprint)."""
-    _, C, H, W = feature_map.size()
-    V = feature_map.view(C, H * W)
-    G = torch.mm(V, V.t())
-    return G / (C * H * W)
-
-
-def content_loss(content_feats, gen_feats):
-    loss = 0.0
-    for layer in CONTENT_LAYERS:
-        loss = loss + torch.sum((content_feats[layer] - gen_feats[layer]) ** 2)
-    return loss
-
-
-def style_loss(style_grams, gen_feats, style_weights):
-    loss = 0.0
-    for layer in STYLE_LAYERS:
-        A = gram_matrix(gen_feats[layer])
-        E = torch.sum((style_grams[layer] - A) ** 2)
-        loss = loss + style_weights[layer] * E
-    return loss
+def total_variation(y):
+    """Smoothness term: sum of absolute neighbour differences."""
+    return (torch.sum(torch.abs(y[:, :, :, :-1] - y[:, :, :, 1:])) +
+            torch.sum(torch.abs(y[:, :, :-1, :] - y[:, :, 1:, :])))
 
 
 def compute_style_weights(tilt):
     """
-    Turn a single 'texture scale' dial into per-layer style weights.
-    tilt < 0  -> favour shallow layers (fine, delicate texture)
-    tilt = 0  -> equal weighting
-    tilt > 0  -> favour deep layers (bold, large-scale shapes)
+    Per-style-layer weights. At tilt=0 all five are 0.2 (equal) — identical to the
+    reference (which averages the layers). tilt<0 favours fine grain, tilt>0 bold.
     """
-    idx = np.arange(len(STYLE_LAYERS))          # 0 = shallow ... 4 = deep
+    idx = np.arange(5)                       # 0 shallow ... 4 deep
     raw = np.exp(tilt * (idx - 2.0))
     raw = raw / raw.sum()
-    return {layer: float(w) for layer, w in zip(STYLE_LAYERS, raw)}
+    return [float(w) for w in raw]
 
 
-def total_variation_loss(img):
-    """
-    Penalise pixel-to-pixel jaggedness so the result is smooth, not noisy.
-    Sums the absolute differences between each pixel and its right/bottom neighbour.
-    """
-    return (torch.sum(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:])) +
-            torch.sum(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :])))
-
-
-def run_style_transfer(content_t, style_t, vgg, beta, steps, style_weights,
-                       alpha=1.0, tv_weight=1.0, progress_cb=None):
-    """Optimise the PIXELS of a generated image toward content + style. Returns a tensor."""
-    content_feats = get_features(content_t, vgg)
-    style_feats = get_features(style_t, vgg)
-    style_grams = {l: gram_matrix(style_feats[l]) for l in STYLE_LAYERS}
+def run_style_transfer(content_t, style_t, model, content_weight, style_weight,
+                       tv_weight, steps, style_layer_weights, progress_cb=None):
+    """Optimise the pixels of a generated image (faithful reference loop)."""
+    content_feats = model(content_t)
+    style_feats = model(style_t)
+    target_content = content_feats[model.content_index].squeeze(0)
+    target_style = [gram_matrix(style_feats[i]) for i in model.style_indices]
 
     generated = content_t.clone().requires_grad_(True)
-    # strong_wolfe line search makes each L-BFGS step actually find a good step
-    # size, instead of a fixed lr=1 that stalls. This is what lets the style
-    # fully "set in". max_iter=1 keeps 1 step == 1 progress-bar tick.
-    optimizer = optim.LBFGS([generated], max_iter=1, line_search_fn="strong_wolfe")
 
-    for step in range(steps):
-        def closure():
+    # The reference runs the WHOLE optimisation in ONE step with max_iter=steps
+    # and a strong-Wolfe line search. This is what actually makes the style set
+    # in — a loop of max_iter=1 steps does not build the L-BFGS trajectory.
+    optimizer = optim.LBFGS([generated], max_iter=steps,
+                            line_search_fn="strong_wolfe")
+
+    mse_mean = torch.nn.MSELoss(reduction="mean")
+    mse_sum = torch.nn.MSELoss(reduction="sum")
+    cnt = [0]
+
+    def closure():
+        if torch.is_grad_enabled():
             optimizer.zero_grad()
-            gen_feats = get_features(generated, vgg)
-            c = content_loss(content_feats, gen_feats)
-            s = style_loss(style_grams, gen_feats, style_weights)
-            tv = total_variation_loss(generated)
-            total = alpha * c + beta * s + tv_weight * tv
+        current = model(generated)
+        current_content = current[model.content_index].squeeze(0)
+        c_loss = mse_mean(target_content, current_content)
+
+        s_loss = 0.0
+        current_style = [gram_matrix(current[i]) for i in model.style_indices]
+        for w, gt, hat in zip(style_layer_weights, target_style, current_style):
+            s_loss = s_loss + w * mse_sum(gt[0], hat[0])
+
+        tv = total_variation(generated)
+        total = content_weight * c_loss + style_weight * s_loss + tv_weight * tv
+        if total.requires_grad:
             total.backward()
-            return total
 
-        optimizer.step(closure)
+        cnt[0] += 1
         if progress_cb is not None:
-            progress_cb(step + 1, steps)
+            progress_cb(min(cnt[0], steps), steps)
+        return total
 
+    optimizer.step(closure)
     return generated.detach()
 
 
@@ -167,15 +185,9 @@ def run_style_transfer(content_t, style_t, vgg, beta, steps, style_weights,
 st.set_page_config(page_title="Picasso, I Choose You!",
                    page_icon="🎨", layout="wide")
 
-# --- a little colour, injected once (a painter's palette) --------------------
 st.markdown(
     """
     <style>
-    :root {
-      --crimson:#E63946; --tangerine:#F4A261; --gold:#E9C46A;
-      --teal:#2A9D8F; --ultramarine:#2E4BC6; --violet:#7B2CBF;
-    }
-    /* vibrant action buttons */
     .stButton > button, .stDownloadButton > button {
       background: linear-gradient(90deg,#E63946,#F4A261,#2A9D8F,#2E4BC6);
       background-size: 250% 100%;
@@ -189,11 +201,8 @@ st.markdown(
       box-shadow: 0 6px 16px rgba(230,57,70,0.25);
     }
     .stButton > button:disabled { background:#d9d4c9; color:#8f8a7c; box-shadow:none; }
-    /* tinted upload dropzones */
     [data-testid="stFileUploaderDropzone"] {
-      border:2px dashed var(--ultramarine);
-      background: rgba(46,75,198,0.05);
-      border-radius:14px;
+      border:2px dashed #2E4BC6; background: rgba(46,75,198,0.05); border-radius:14px;
     }
     </style>
     """,
@@ -202,21 +211,17 @@ st.markdown(
 
 
 def step_badge(num, text, color):
-    """A numbered, coloured section heading."""
     st.markdown(
-        f'<div style="display:flex;align-items:center;gap:0.6rem;'
-        f'margin:0.9rem 0 0.4rem;">'
+        f'<div style="display:flex;align-items:center;gap:0.6rem;margin:0.9rem 0 0.4rem;">'
         f'<span style="background:{color};color:#fff;width:1.9rem;height:1.9rem;'
-        f'border-radius:50%;display:inline-flex;align-items:center;'
-        f'justify-content:center;font-weight:800;flex:0 0 auto;">{num}</span>'
-        f'<span style="font-size:1.3rem;font-weight:800;color:#1F2933;">{text}</span>'
-        f'</div>',
+        f'border-radius:50%;display:inline-flex;align-items:center;justify-content:center;'
+        f'font-weight:800;flex:0 0 auto;">{num}</span>'
+        f'<span style="font-size:1.3rem;font-weight:800;color:#1F2933;">{text}</span></div>',
         unsafe_allow_html=True,
     )
 
 
 def chip(text, color):
-    """A small coloured pill for live feedback under a control."""
     st.markdown(
         f'<div style="display:inline-block;background:{color}22;color:{color};'
         f'border:1px solid {color}66;padding:0.3rem 0.75rem;border-radius:999px;'
@@ -227,14 +232,13 @@ def chip(text, color):
 
 st.title("🎨 Picasso, I Choose You!")
 st.markdown(
-    "**Repaint your photo in the style of any artwork.** "
-    "Bring a photo and a piece of art — a painting, a comic panel, a texture — "
-    "and blend them into something new for your posters, covers, and prints."
+    "**Repaint your photo in the style of any artwork.** Bring a photo and a piece "
+    "of art — a painting, a comic panel, a texture — and blend them into something "
+    "new for your posters, covers, and prints."
 )
 
 create_tab, about_tab = st.tabs(["Create", "How it works"])
 
-# ---------- CREATE TAB -------------------------------------------------------
 with create_tab:
     st.markdown(
         '<div style="background:linear-gradient(120deg,#E63946,#F4A261,#E9C46A,'
@@ -248,67 +252,57 @@ with create_tab:
     )
 
     step_badge(1, "Bring your two images", "#E63946")
-
     col_content, col_style = st.columns(2)
     with col_content:
-        content_file = st.file_uploader(
-            "Your photo (the subject to keep)",
-            type=["jpg", "jpeg", "png"], key="content")
+        content_file = st.file_uploader("Your photo (the subject to keep)",
+                                        type=["jpg", "jpeg", "png"], key="content")
         if content_file:
-            content_img = Image.open(content_file)
-            st.image(content_img, caption="Photo", use_container_width=True)
-
+            st.image(Image.open(content_file), caption="Photo", use_container_width=True)
     with col_style:
-        style_file = st.file_uploader(
-            "The artwork (the look to borrow)",
-            type=["jpg", "jpeg", "png"], key="style")
+        style_file = st.file_uploader("The artwork (the look to borrow)",
+                                      type=["jpg", "jpeg", "png"], key="style")
         if style_file:
-            style_img = Image.open(style_file)
-            st.image(style_img, caption="Style", use_container_width=True)
+            st.image(Image.open(style_file), caption="Style", use_container_width=True)
 
     step_badge(2, "Dial in the look", "#2A9D8F")
 
-    # --- Style strength -> beta (log scale). strength 7 == the validated 1e7 ---
-    strength = st.slider(
-        "Style strength", min_value=1, max_value=10, value=7,
-        help="How strongly the artwork's look takes over your photo.")
+    # Style strength -> style_weight (content_weight fixed at 1e5, as in the reference).
+    strength = st.slider("Style strength", 1, 10, 7,
+                         help="How strongly the artwork's look takes over your photo.")
     if strength <= 3:
         chip("Gentle — your photo stays clearly recognisable", "#2A9D8F")
     elif strength <= 7:
         chip("Balanced — a clear repaint that still reads as your photo", "#2E4BC6")
     else:
         chip("Bold — the artwork's colours and textures take over", "#E63946")
-    beta = 10.0 ** (5.0 + (strength - 1) / 3.0)
+    content_weight = 1e5
+    style_weight = 10.0 ** (3.0 + (strength - 1) / 3.0)   # s7 -> 1e5, s10 -> 1e6
+    tv_weight = 1.0
 
     col_a, col_b = st.columns(2)
     with col_a:
-        size = st.slider(
-            "Detail", min_value=256, max_value=512, value=400, step=32,
-            help="Bigger = sharper, more detailed — but slower to create.")
-        st.caption("Larger sizes look crisper but take longer. On the free cloud, "
-                   "keep this around 400 or below to stay within memory.")
+        size = st.slider("Detail", 256, 512, 400, step=32,
+                         help="Bigger = sharper, more detailed — but slower.")
+        st.caption("On the free CPU cloud, keep this around 400 or below.")
     with col_b:
-        steps = st.slider(
-            "Refinement passes", min_value=50, max_value=800, value=300, step=25,
-            help="More passes let the style fully set in; fewer finish faster.")
-        st.caption("Roughly linear with wait time. 300 gives a strong result; "
-                   "drop to ~100 for a quick preview, raise toward 600+ for max effect.")
+        steps = st.slider("Refinement passes", 50, 1000, 300, step=25,
+                          help="How many L-BFGS iterations. More = stronger, slower.")
+        st.caption("300 gives a strong result; the reference uses ~1000.")
 
     with st.expander("Advanced — texture scale"):
-        tilt = st.slider(
-            "Fine  ←→  Bold", min_value=-1.5, max_value=1.5, value=0.0, step=0.1,
-            help="Which scale of the artwork's texture to emphasise.")
+        tilt = st.slider("Fine  ←→  Bold", -1.5, 1.5, 0.0, step=0.1,
+                         help="Which scale of the artwork's texture to emphasise.")
         if tilt < -0.3:
             chip("Fine detail — delicate, brush-like grain", "#7B2CBF")
         elif tilt > 0.3:
             chip("Bold shapes — large sweeps and blocks of colour", "#F4A261")
         else:
-            chip("Balanced — fine detail and large shapes", "#2A9D8F")
-    style_weights = compute_style_weights(tilt)
+            chip("Balanced — fine detail and large shapes (reference default)", "#2A9D8F")
+    style_layer_weights = compute_style_weights(tilt)
 
     step_badge(3, "Create", "#7B2CBF")
-    st.caption("This runs an optimisation on the free CPU cloud, so expect a few "
-               "minutes. Lower the detail and passes for a quicker preview.")
+    st.caption("This runs on CPU here, so expect a few minutes. Lower Detail and "
+               "passes for a quicker preview.")
 
     ready = content_file is not None and style_file is not None
     if not ready:
@@ -326,18 +320,17 @@ with create_tab:
 
         with st.spinner("Creating your artwork…"):
             output_t = run_style_transfer(
-                content_t, style_t, vgg, beta=beta, steps=steps,
-                style_weights=style_weights, progress_cb=progress_cb)
+                content_t, style_t, vgg,
+                content_weight=content_weight, style_weight=style_weight,
+                tv_weight=tv_weight, steps=steps,
+                style_layer_weights=style_layer_weights, progress_cb=progress_cb)
             result = deprocess(output_t)
 
         bar.empty()
-
-        # keep the result in session so downloading doesn't recompute
         buf = io.BytesIO()
         result.save(buf, format="PNG")
         st.session_state["result_png"] = buf.getvalue()
 
-        # be gentle with the 1 GB memory limit
         del content_t, style_t, output_t
         gc.collect()
 
@@ -345,80 +338,42 @@ with create_tab:
         step_badge("★", "Your artwork", "#2A9D8F")
         with st.container(border=True):
             st.image(st.session_state["result_png"], use_container_width=True)
-        st.download_button(
-            "Download PNG", data=st.session_state["result_png"],
-            file_name="picasso.png", mime="image/png")
+        st.download_button("Download PNG", data=st.session_state["result_png"],
+                           file_name="picasso.png", mime="image/png")
 
-# ---------- ABOUT TAB --------------------------------------------------------
 with about_tab:
     st.subheader("What's happening under the hood")
     st.markdown(
-        "This tool uses a technique called **neural style transfer**. A neural "
-        "network that was originally trained to recognise objects in photos turns "
-        "out to also be very good at separating *what* is in a picture (its "
-        "**content** — the shapes and subjects) from *how* it is painted (its "
-        "**style** — the colours, brushwork, and texture).\n\n"
-        "The app starts with a copy of your photo and gently repaints it, over and "
-        "over, nudging it until its **content still matches your photo** but its "
-        "**style matches the artwork** you chose. Every slider you see is a way of "
-        "steering that balance:\n\n"
-        "- **Style strength** decides who wins the tug-of-war between your photo and the artwork.\n"
-        "- **Detail** sets how large the working image is — bigger looks sharper but takes longer.\n"
-        "- **Refinement passes** are how many times the picture gets nudged toward the goal.\n"
-        "- **Texture scale** chooses whether to borrow the artwork's fine grain or its bold shapes."
+        "This tool uses **neural style transfer**. A frozen, pretrained **VGG19** "
+        "network reads both images. The **content** of your photo is taken from a "
+        "deep layer (conv4_2); the **style** of the artwork is taken from **Gram "
+        "matrices** — how strongly features fire together — across five layers "
+        "(relu1_1 … relu5_1). Starting from a copy of your photo, the app optimises "
+        "the *pixels* (not the network's weights) to match your photo's content and "
+        "the artwork's style."
+    )
+    st.latex(r"\mathcal{L}_{total} = w_c\,\mathcal{L}_{content} + w_s\,\mathcal{L}_{style} + w_{tv}\,\mathcal{L}_{tv}")
+    st.markdown(
+        "Optimisation uses **L-BFGS with a strong-Wolfe line search**, run as a single "
+        "full optimisation — the key detail that lets the style fully set in."
     )
 
-    st.subheader("The idea, a little more precisely")
+    st.subheader("What each control changes")
     st.markdown(
-        "Under the hood, a pretrained **VGG19** network reads both images. The "
-        "*content* of your photo is captured by the activations at one deep layer; "
-        "the *style* of the artwork is captured by **Gram matrices** — how strongly "
-        "different features fire together — across several layers. The generated "
-        "image is then optimised (its pixels are the variables, not the network's "
-        "weights) to minimise a combined loss:\n"
-    )
-    st.latex(r"\mathcal{L}_{total} = \alpha\,\mathcal{L}_{content} + \beta\,\mathcal{L}_{style}")
-    st.markdown(
-        "The **Style strength** slider is really the ratio of β to α, set on a "
-        "logarithmic scale so the useful range fits into a friendly 1–10 dial."
-    )
-
-    st.subheader("What each control really changes")
-    st.markdown(
-        "The loss function itself has only **two hyperparameters, α and β** — but the "
-        "full method has a few more knobs that steer the *optimisation* and the "
-        "*inputs* rather than the loss. Here's how the sliders map to the maths:\n\n"
-        "- **Style strength → β.** With α fixed at 1.0, this is the one true loss "
-        "hyperparameter you're changing — the α/β balance. It's set on a log scale "
-        "(strength 7 ≈ β of 1e7).\n"
-        "- **Texture scale → the style-layer weights wₗ.** The style loss is "
-        "Lstyle = Σ wₗ·Eₗ, a weighted sum over five layers. This dial tilts those "
-        "weights toward shallow layers (fine grain) or deep layers (bold shapes). "
-        "It's part of the loss, just not one of α/β.\n"
-        "- **Refinement passes → number of optimisation steps.** *Not* a loss "
-        "hyperparameter — it's how many iterations the optimiser runs. It changes how "
-        "close you get to the optimum, not what the optimum is.\n"
-        "- **Detail → the input image resolution.** Also not part of the loss — it's a "
-        "preprocessing choice that affects sharpness and speed.\n\n"
-        "So α, β and the wₗ weights define the *objective*; passes and resolution are "
-        "practical settings every implementation has but that don't appear in the loss "
-        "equation. That's why the Gatys paper and Prof. Khapra's lecture centre on "
-        "α and β."
+        "- **Style strength** → the style weight `w_s` (content weight is fixed), on a "
+        "log scale. Higher = the artwork dominates.\n"
+        "- **Texture scale** → the per-layer style weights (fine grain vs bold shapes); "
+        "the centre is the reference's equal weighting.\n"
+        "- **Refinement passes** → number of L-BFGS iterations (not part of the loss).\n"
+        "- **Detail** → the working image resolution (not part of the loss)."
     )
 
     st.subheader("Credits & sources")
     st.markdown(
-        "This project follows **Prof. Mitesh M. Khapra's** *Deep Art* lecture from "
-        "the CS7015 (Deep Learning) course at IIT Madras — the walkthrough of the "
-        "content loss, the Gram-matrix style representation, and the combined "
-        "objective is taken directly from that lecture.\n\n"
-        "The underlying method is from:\n\n"
-        "- Leon A. Gatys, Alexander S. Ecker & Matthias Bethge, "
-        "*A Neural Algorithm of Artistic Style* (2015), arXiv:1508.06576 — "
-        "https://arxiv.org/abs/1508.06576\n"
-        "- The expanded, peer-reviewed version: *Image Style Transfer Using "
-        "Convolutional Neural Networks*, CVPR 2016.\n\n"
-        "The recognition network is **VGG19** (Simonyan & Zisserman, 2014). "
-        "Deep gratitude to these authors and educators; this app is a learning "
-        "project built on their work."
+        "Engine follows the reference implementation "
+        "(github.com/nazianafis/Neural-Style-Transfer, based on Aleksa Gordic's).\n\n"
+        "- Prof. Mitesh M. Khapra — *Deep Art* lecture, CS7015, IIT Madras\n"
+        "- Gatys, Ecker & Bethge — *A Neural Algorithm of Artistic Style* (2015), "
+        "arXiv:1508.06576\n"
+        "- VGG19 — Simonyan & Zisserman (2014)"
     )
