@@ -12,6 +12,8 @@ dependencies = [
     "torchvision>=0.17.2",
 ]
 
+# CPU-only PyTorch: no CUDA stack (avoids the memory crash on the 1 GB tier),
+# and much smaller wheels.
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
