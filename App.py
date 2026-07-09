@@ -174,24 +174,60 @@ st.set_page_config(page_title="Picasso, I Choose You!", page_icon="🎨", layout
 st.markdown(
     """
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&display=swap');
+
+    .pic-hero { display:flex; align-items:center; gap:1rem; margin:0.2rem 0 0.5rem; }
+    .pic-emblem { flex:0 0 auto; filter: drop-shadow(0 4px 10px rgba(0,0,0,0.12)); }
+    .pic-wordmark {
+      font-family:'Fredoka',sans-serif; font-weight:700; font-size:2.5rem; line-height:1.02;
+      background:linear-gradient(90deg,#E63946,#F4A261,#E9C46A,#2A9D8F,#2E4BC6,#7B2CBF);
+      background-size:200% auto; -webkit-background-clip:text; background-clip:text;
+      -webkit-text-fill-color:transparent; color:transparent;
+      animation: picshift 9s linear infinite;
+    }
+    @keyframes picshift { to { background-position:200% center; } }
+    .pic-tag { font-family:'Fredoka',sans-serif; font-weight:500; color:#5b6472;
+               font-size:1.05rem; margin-top:0.15rem; letter-spacing:.2px; }
+    .pic-h { font-family:'Fredoka',sans-serif; font-weight:700; color:#1F2933; }
+    h1,h2,h3 { font-family:'Fredoka',sans-serif !important; }
+
     .stButton > button, .stDownloadButton > button {
-      background: linear-gradient(90deg,#E63946,#F4A261,#2A9D8F,#2E4BC6);
-      background-size: 250% 100%; color:#fff; border:none; border-radius:12px;
-      padding:0.6rem 1.4rem; font-weight:700; font-size:1.02rem;
+      background: linear-gradient(90deg,#E63946,#7B2CBF);
+      background-size: 180% 100%; color:#fff; border:none; border-radius:12px;
+      padding:0.6rem 1.5rem; font-weight:700; font-size:1.02rem; font-family:'Fredoka',sans-serif;
       transition: background-position .5s ease, transform .1s ease, box-shadow .2s ease;
-      box-shadow: 0 3px 10px rgba(46,75,198,0.18);
+      box-shadow: 0 3px 12px rgba(123,44,191,0.22);
     }
     .stButton > button:hover, .stDownloadButton > button:hover {
       background-position:100% 0; transform:translateY(-1px); color:#fff;
-      box-shadow: 0 6px 16px rgba(230,57,70,0.25);
+      box-shadow: 0 6px 18px rgba(230,57,70,0.28);
     }
     .stButton > button:disabled { background:#d9d4c9; color:#8f8a7c; box-shadow:none; }
     [data-testid="stFileUploaderDropzone"] {
       border:2px dashed #2E4BC6; background: rgba(46,75,198,0.05); border-radius:14px;
     }
+    @media (prefers-reduced-motion: reduce) { .pic-wordmark { animation:none; } }
     </style>
     """,
     unsafe_allow_html=True,
+)
+
+# The signature emblem: a Poké Ball fused with a painter's palette.
+EMBLEM_SVG = (
+    '<svg class="pic-emblem" viewBox="0 0 100 100" width="66" height="66" '
+    'role="img" aria-label="Palette Ball">'
+    '<defs><linearGradient id="pb" x1="0" y1="0" x2="1" y2="1">'
+    '<stop offset="0" stop-color="#E63946"/><stop offset=".35" stop-color="#F4A261"/>'
+    '<stop offset=".65" stop-color="#2A9D8F"/><stop offset="1" stop-color="#7B2CBF"/>'
+    '</linearGradient></defs>'
+    '<circle cx="50" cy="50" r="45" fill="#fff" stroke="#1F2933" stroke-width="5"/>'
+    '<path d="M7 50a43 43 0 0 1 86 0Z" fill="url(#pb)"/>'
+    '<circle cx="35" cy="33" r="3.6" fill="#fff" opacity=".9"/>'
+    '<circle cx="53" cy="26" r="3.6" fill="#E9C46A"/>'
+    '<circle cx="69" cy="35" r="3.6" fill="#2E4BC6"/>'
+    '<rect x="5" y="46" width="90" height="8" fill="#1F2933"/>'
+    '<circle cx="50" cy="50" r="14" fill="#fff" stroke="#1F2933" stroke-width="5"/>'
+    '<circle cx="50" cy="50" r="6" fill="#E63946"/></svg>'
 )
 
 
@@ -210,27 +246,24 @@ def _num(label):
     return float(label.replace(",", ""))
 
 
-st.title("🎨 Picasso, I Choose You!")
 st.markdown(
-    "**Repaint your photo in the style of any artwork.** Bring a photo and a piece "
-    "of art, choose where to start, and blend them into something new."
+    f'<div class="pic-hero">{EMBLEM_SVG}'
+    '<div><div class="pic-wordmark">Picasso, I Choose You!</div>'
+    '<div class="pic-tag">Gotta paint \'em all — turn any photo into art.</div>'
+    '</div></div>',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    "Bring a photo and an artwork, choose where to start, and blend them into "
+    "something new — for posters, covers, and prints."
 )
 
 create_tab, about_tab = st.tabs(["Create", "How it works"])
 
 with create_tab:
-    st.markdown(
-        '<div style="background:linear-gradient(120deg,#E63946,#F4A261,#E9C46A,'
-        '#2A9D8F,#2E4BC6,#7B2CBF);padding:1.3rem 1.6rem;border-radius:18px;'
-        'margin:0.3rem 0 0.6rem;color:#fff;box-shadow:0 6px 18px rgba(0,0,0,0.12);">'
-        '<div style="font-size:1.55rem;font-weight:800;">Turn a photo into a painting</div>'
-        '<div style="opacity:0.95;margin-top:0.25rem;font-size:1.02rem;">'
-        'Upload a photo and an artwork, pick a starting point, and let the studio blend them.'
-        '</div></div>',
-        unsafe_allow_html=True,
-    )
-
-    advanced = st.session_state.get("has_generated", False)
+    st.markdown('<div class="pic-h" style="font-size:1.35rem;margin:0.4rem 0 0.1rem;">'
+                'Set up your match-up</div>', unsafe_allow_html=True)
+    st.caption("A photo to keep, an artwork to borrow from — then let them meet on the canvas.")
 
     # --- Step 1: images ---
     step_badge(1, "Bring your two images", "#E63946")
@@ -265,10 +298,18 @@ with create_tab:
         st.caption("Starting from your photo keeps the subject crisp. Flat backgrounds "
                    "may stay plain unless the style is a bold painting.")
 
-    # --- Step 3: hyperparameters (only after the first render) ---
-    if advanced:
-        step_badge(3, "Fine-tune (optional)", "#7B2CBF")
-        with st.expander("Hyperparameters", expanded=True):
+    # --- Step 3: settings — ask first, don't force anything ---
+    step_badge(3, "Settings", "#7B2CBF")
+    settings_mode = st.radio(
+        "How would you like to set the controls?",
+        ["Use the recommended defaults", "Customise the settings myself"],
+        index=0,
+    )
+    st.caption("Recommended defaults: style weight 30,000 · content weight 100,000 · "
+               "smoothness (TV) 1 · detail 400px · 1000 refinement passes.")
+
+    if settings_mode.startswith("Customise"):
+        with st.expander("Adjust the hyperparameters", expanded=True):
             style_weight = _num(st.select_slider(
                 "Style weight",
                 options=["10", "100", "1,000", "3,000", "10,000", "30,000",
@@ -292,8 +333,8 @@ with create_tab:
             with c2:
                 iterations = st.slider("Refinement passes", 50, 1000, 1000, step=50,
                                        help="L-BFGS iterations. Recommended 1000.")
-                st.caption("1000 is the recommended default — slow on CPU (several "
-                           "minutes). Lower to ~300 for a quick preview.")
+                st.caption("1000 is the recommended default. Lower to ~300 for a "
+                           "quick preview.")
             tilt = st.slider("Texture scale  (Fine ←→ Bold)", -1.5, 1.5, 0.0, step=0.1,
                              help="Emphasise fine grain vs bold shapes. 0 = equal weighting.")
     else:
@@ -303,8 +344,6 @@ with create_tab:
         height = DEFAULTS["height"]
         iterations = DEFAULTS["iterations"]
         tilt = 0.0
-        st.caption("Your first render uses recommended default settings. You'll be able "
-                   "to fine-tune every hyperparameter afterwards.")
 
     style_layer_weights = compute_style_weights(tilt)
 
@@ -313,7 +352,7 @@ with create_tab:
     if not ready:
         st.info("Add both a photo and an artwork above to begin.")
 
-    if st.button("Create artwork", type="primary", disabled=not ready):
+    if st.button("🎨 Paint it!", type="primary", disabled=not ready):
         vgg = load_vgg()
         content_file.seek(0)
         style_file.seek(0)
@@ -338,14 +377,12 @@ with create_tab:
         buf = io.BytesIO()
         result.save(buf, format="PNG")
         st.session_state["result_png"] = buf.getvalue()
-        st.session_state["has_generated"] = True
 
         del content_t, style_t, output_t
         gc.collect()
-        st.rerun()
 
     if "result_png" in st.session_state:
-        step_badge("★", "Your artwork", "#2A9D8F")
+        step_badge("★", "Your masterpiece", "#2A9D8F")
         with st.container(border=True):
             st.image(st.session_state["result_png"], use_container_width=True)
         st.download_button("Download PNG", data=st.session_state["result_png"],
